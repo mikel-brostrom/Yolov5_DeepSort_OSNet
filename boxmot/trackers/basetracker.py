@@ -17,7 +17,8 @@ class BaseTracker(ABC):
         max_obs: int = 50,
         nr_classes: int = 80,
         per_class: bool = False,
-        asso_func: str = 'iou'
+        asso_func: str = 'iou',
+        is_obb: bool = False
     ):
         """
         Initialize the BaseTracker object with detection threshold, maximum age, minimum hits, 
@@ -41,8 +42,9 @@ class BaseTracker(ABC):
         self.nr_classes = nr_classes
         self.iou_threshold = iou_threshold
         self.last_emb_size = None
-        self.asso_func_name = asso_func
-
+        self.asso_func_name = asso_func+"_obb" if is_obb else asso_func
+        self.is_obb = is_obb
+        
         self.frame_count = 0
         self.active_tracks = []  # This might be handled differently in derived classes
         self.per_class_active_tracks = None
@@ -178,9 +180,17 @@ class BaseTracker(ABC):
         assert (
             len(dets.shape) == 2
         ), "Unsupported 'dets' dimensions, valid number of dimensions is two"
-        assert (
-            dets.shape[1] == 6
-        ), "Unsupported 'dets' 2nd dimension lenght, valid lenghts is 6"
+        if self.is_obb :
+
+            assert (
+                dets.shape[1] == 7
+            ), "Unsupported 'dets' 2nd dimension lenght, valid lenghts is 6 (cx,cy,w,h,angle,conf,cls)"
+            
+        else :
+            assert (
+                dets.shape[1] == 6
+            ), "Unsupported 'dets' 2nd dimension lenght, valid lenghts is 6 (x1,y1,x2,y2,conf,cls)"
+
 
     def id_to_color(self, id: int, saturation: float = 0.75, value: float = 0.95) -> tuple:
         """

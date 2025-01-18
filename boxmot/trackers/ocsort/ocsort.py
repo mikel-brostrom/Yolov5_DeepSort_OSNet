@@ -6,16 +6,21 @@
 import numpy as np
 from collections import deque
 
+import cv2 as cv
 
 from boxmot.motion.kalman_filters.xysr_kf import KalmanFilterXYSR
+from boxmot.motion.kalman_filters.xywha_kf import KalmanFilterXYWHA
 from boxmot.utils.association import associate, linear_assignment
 from boxmot.trackers.basetracker import BaseTracker
 from boxmot.utils.ops import xyxy2xysr
 
 
-def k_previous_obs(observations, cur_age, k):
+def k_previous_obs(observations, cur_age, k, is_obb=False):
     if len(observations) == 0:
-        return [-1, -1, -1, -1, -1]
+        if is_obb:
+            return [-1, -1, -1, -1, -1, -1]
+        else :
+            return [-1, -1, -1, -1, -1]
     for i in range(k):
         dt = k - i
         if cur_age - dt in observations:
@@ -44,6 +49,13 @@ def convert_x_to_bbox(x, score=None):
 def speed_direction(bbox1, bbox2):
     cx1, cy1 = (bbox1[0] + bbox1[2]) / 2.0, (bbox1[1] + bbox1[3]) / 2.0
     cx2, cy2 = (bbox2[0] + bbox2[2]) / 2.0, (bbox2[1] + bbox2[3]) / 2.0
+    speed = np.array([cy2 - cy1, cx2 - cx1])
+    norm = np.sqrt((cy2 - cy1) ** 2 + (cx2 - cx1) ** 2) + 1e-6
+    return speed / norm
+
+def speed_direction_obb(bbox1, bbox2):
+    cx1, cy1 = bbox1[0], bbox1[1]
+    cx2, cy2 = bbox2[0], bbox2[1]
     speed = np.array([cy2 - cy1, cx2 - cx1])
     norm = np.sqrt((cy2 - cy1) ** 2 + (cx2 - cx1) ** 2) + 1e-6
     return speed / norm
@@ -179,6 +191,141 @@ class KalmanBoxTracker(object):
         return convert_x_to_bbox(self.kf.x)
 
 
+class KalmanBoxTrackerOBB(object):
+    """
+    This class represents the internal state of individual tracked objects observed as oriented bbox.
+    """
+
+    count = 0
+
+    def __init__(self, bbox, cls, det_ind, delta_t=3, max_obs=50, Q_xy_scaling = 0.01, Q_a_scaling = 0.01):
+        """
+        Initialises a tracker using initial bounding box.
+
+        """
+        # define constant velocity model
+        self.det_ind = det_ind
+
+        self.Q_xy_scaling = Q_xy_scaling
+        self.Q_a_scaling = Q_a_scaling
+
+        self.kf = KalmanFilterXYWHA(dim_x=10, dim_z=5, max_obs=max_obs)
+        self.kf.F = np.array(
+            [
+                [1, 0, 0, 0, 0, 1, 0, 0, 0, 0],  # cx = cx + vx
+                [0, 1, 0, 0, 0, 0, 1, 0, 0, 0],  # cy = cy + vy
+                [0, 0, 1, 0, 0, 0, 0, 1, 0, 0],  # w = w + vw
+                [0, 0, 0, 1, 0, 0, 0, 0, 1, 0],  # h = h + vh
+                [0, 0, 0, 0, 1, 0, 0, 0, 0, 1],  # a = a + va
+                [0, 0, 0, 0, 0, 1, 0, 0, 0, 0], 
+                [0, 0, 0, 0, 0, 0, 1, 0, 0, 0], 
+                [0, 0, 0, 0, 0, 0, 0, 1, 0, 0], 
+                [0, 0, 0, 0, 0, 0, 0, 0, 1, 0], 
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        ] 
+    )
+        self.kf.H = np.array(
+            [
+                [1, 0, 0, 0, 0, 0, 0, 0, 0 ,0],  # cx
+                [0, 1, 0, 0, 0, 0, 0, 0, 0, 0],  # cy
+                [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # w
+                [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # h
+                [0, 0, 0, 0, 1, 0, 0, 0, 0, 0],  # angle
+    ]
+        )
+
+        self.kf.R[2:, 2:] *= 10.0
+        self.kf.P[
+            5:, 5:
+        ] *= 1000.0  # give high uncertainty to the unobservable initial velocities
+        self.kf.P *= 10.0
+
+        self.kf.Q[5:7, 5:7] *= self.Q_xy_scaling
+        self.kf.Q[-1, -1] *= self.Q_a_scaling
+
+        self.kf.x[:5] = bbox[:5].reshape((5, 1)) # x, y, w, h, angle   (dont take confidence score)
+        self.time_since_update = 0
+        self.id = KalmanBoxTrackerOBB.count
+        KalmanBoxTrackerOBB.count += 1
+        self.max_obs = max_obs
+        self.history = deque([], maxlen=self.max_obs)
+        self.hits = 0
+        self.hit_streak = 0
+        self.age = 0
+        self.conf = bbox[-1]
+        self.cls = cls
+        """
+        NOTE: [-1,-1,-1,-1,-1] is a compromising placeholder for non-observation status, the same for the return of
+        function k_previous_obs. It is ugly and I do not like it. But to support generate observation array in a
+        fast and unified way, which you would see below k_observations = np.array([k_previous_obs(...]]),
+        let's bear it for now.
+        """
+        self.last_observation = np.array([-1, -1, -1, -1, -1, -1])  #WARNING : -1 is a valid angle value 
+        self.observations = dict()
+        self.history_observations = deque([], maxlen=self.max_obs)
+        self.velocity = None
+        self.delta_t = delta_t
+
+    def update(self, bbox, cls, det_ind):
+        """
+        Updates the state vector with observed bbox.
+        """
+        self.det_ind = det_ind
+        if bbox is not None:
+            self.conf = bbox[-1]
+            self.cls = cls
+            if self.last_observation.sum() >= 0:  # no previous observation
+                previous_box = None
+                for i in range(self.delta_t):
+                    dt = self.delta_t - i
+                    if self.age - dt in self.observations:
+                        previous_box = self.observations[self.age - dt]
+                        break
+                if previous_box is None:
+                    previous_box = self.last_observation
+                """
+                  Estimate the track speed direction with observations \Delta t steps away
+                """
+                self.velocity = speed_direction_obb(previous_box, bbox)
+
+            """
+              Insert new observations. This is a ugly way to maintain both self.observations
+              and self.history_observations. Bear it for the moment.
+            """
+            self.last_observation = bbox
+            self.observations[self.age] = bbox
+            self.history_observations.append(bbox)
+
+            self.time_since_update = 0
+            self.hits += 1
+            self.hit_streak += 1
+            self.kf.update(bbox[:5].reshape((5, 1))) # x, y, w, h, angle as column vector   (dont take confidence score)
+        else:
+            self.kf.update(bbox)
+
+    def predict(self):
+        """
+        Advances the state vector and returns the predicted bounding box estimate.
+        """
+        if (self.kf.x[7] + self.kf.x[2]) <= 0: # Negative width
+            self.kf.x[7] *= 0.0
+        if (self.kf.x[8] + self.kf.x[3]) <= 0: # Negative Height
+            self.kf.x[8] *= 0.0
+        self.kf.predict()
+        self.age += 1
+        if self.time_since_update > 0:
+            self.hit_streak = 0
+        self.time_since_update += 1
+        self.history.append(self.kf.x[0:5].reshape((1, 5)))
+        return self.history[-1]
+
+    def get_state(self):
+        """
+        Returns the current bounding box estimate.
+        """
+        return self.kf.x[0:5].reshape((1, 5))
+
+
 class OcSort(BaseTracker):
     """
     OCSort Tracker: A tracking algorithm that utilizes motion-based tracking.
@@ -208,9 +355,10 @@ class OcSort(BaseTracker):
         inertia: float = 0.2,
         use_byte: bool = False,
         Q_xy_scaling: float = 0.01,
-        Q_s_scaling: float = 0.0001
+        Q_s_scaling: float = 0.0001,
+        is_obb: bool = False
     ):
-        super().__init__(max_age=max_age, per_class=per_class, asso_func=asso_func)
+        super().__init__(max_age=max_age, per_class=per_class, asso_func=asso_func, is_obb=is_obb)
         """
         Sets key parameters for SORT
         """
@@ -245,7 +393,7 @@ class OcSort(BaseTracker):
         h, w = img.shape[0:2]
 
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
-        confs = dets[:, 4]
+        confs = dets[:, 4+self.is_obb] 
 
         inds_low = confs > 0.1
         inds_high = confs < self.det_thresh
@@ -257,12 +405,12 @@ class OcSort(BaseTracker):
         dets = dets[remain_inds]
 
         # get predicted locations from existing trackers.
-        trks = np.zeros((len(self.active_tracks), 5))
+        trks = np.zeros((len(self.active_tracks), 5+self.is_obb))
         to_del = []
         ret = []
         for t, trk in enumerate(trks):
             pos = self.active_tracks[t].predict()[0]
-            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+            trk[:] = [pos[i] for i in range(4+self.is_obb)] + [0]
             if np.any(np.isnan(pos)):
                 to_del.append(t)
         trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
@@ -276,9 +424,10 @@ class OcSort(BaseTracker):
             ]
         )
         last_boxes = np.array([trk.last_observation for trk in self.active_tracks])
+
         k_observations = np.array(
             [
-                k_previous_obs(trk.observations, trk.age, self.delta_t)
+                k_previous_obs(trk.observations, trk.age, self.delta_t, is_obb=self.is_obb)
                 for trk in self.active_tracks
             ]
         )
@@ -287,10 +436,10 @@ class OcSort(BaseTracker):
             First round of association
         """
         matched, unmatched_dets, unmatched_trks = associate(
-            dets[:, 0:5], trks, self.asso_func, self.asso_threshold, velocities, k_observations, self.inertia, w, h
+            dets[:, 0:5+self.is_obb], trks, self.asso_func, self.asso_threshold, velocities, k_observations, self.inertia, w, h
         )
         for m in matched:
-            self.active_tracks[m[1]].update(dets[m[0], :5], dets[m[0], 5], dets[m[0], 6])
+            self.active_tracks[m[1]].update(dets[m[0], :-2], dets[m[0], -2], dets[m[0], -1])
 
         """
             Second round of associaton by OCR
@@ -315,7 +464,7 @@ class OcSort(BaseTracker):
                     if iou_left[m[0], m[1]] < self.asso_threshold:
                         continue
                     self.active_tracks[trk_ind].update(
-                        dets_second[det_ind, :5], dets_second[det_ind, 5], dets_second[det_ind, 6]
+                        dets_second[det_ind, :-2], dets_second[det_ind, -2], dets_second[det_ind, -1]
                     )
                     to_remove_trk_indices.append(trk_ind)
                 unmatched_trks = np.setdiff1d(
@@ -340,7 +489,7 @@ class OcSort(BaseTracker):
                     det_ind, trk_ind = unmatched_dets[m[0]], unmatched_trks[m[1]]
                     if iou_left[m[0], m[1]] < self.asso_threshold:
                         continue
-                    self.active_tracks[trk_ind].update(dets[det_ind, :5], dets[det_ind, 5], dets[det_ind, 6])
+                    self.active_tracks[trk_ind].update(dets[det_ind, :-2], dets[det_ind, -2], dets[det_ind, -1])
                     to_remove_det_indices.append(det_ind)
                     to_remove_trk_indices.append(trk_ind)
                 unmatched_dets = np.setdiff1d(
@@ -355,7 +504,10 @@ class OcSort(BaseTracker):
 
         # create and initialise new trackers for unmatched detections
         for i in unmatched_dets:
-            trk = KalmanBoxTracker(dets[i, :5], dets[i, 5], dets[i, 6], delta_t=self.delta_t, Q_xy_scaling=self.Q_xy_scaling, Q_s_scaling=self.Q_s_scaling, max_obs=self.max_obs)
+            if self.is_obb:
+                trk = KalmanBoxTrackerOBB(dets[i, :-2], dets[i, -2], dets[i, -1], delta_t=self.delta_t, Q_xy_scaling=self.Q_xy_scaling, Q_a_scaling=self.Q_s_scaling, max_obs=self.max_obs)
+            else:
+                trk = KalmanBoxTracker(dets[i, :5], dets[i, 5], dets[i, 6], delta_t=self.delta_t, Q_xy_scaling=self.Q_xy_scaling, Q_s_scaling=self.Q_s_scaling, max_obs=self.max_obs)
             self.active_tracks.append(trk)
         i = len(self.active_tracks)
         for trk in reversed(self.active_tracks):
@@ -366,7 +518,7 @@ class OcSort(BaseTracker):
                 this is optional to use the recent observation or the kalman filter prediction,
                 we didn't notice significant difference here
                 """
-                d = trk.last_observation[:4]
+                d = trk.last_observation[:4+self.is_obb]
             if (trk.time_since_update < 1) and (
                 trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits
             ):
@@ -383,3 +535,139 @@ class OcSort(BaseTracker):
         if len(ret) > 0:
             return np.concatenate(ret)
         return np.array([])
+    
+    def plot_box_on_img(self, img: np.ndarray, box: tuple, conf: float, cls: int, id: int, thickness: int = 2, fontscale: float = 0.5) -> np.ndarray:
+        """
+        Draws a bounding box with ID, confidence, and class information on an image.
+
+        Parameters:
+        - img (np.ndarray): The image array to draw on.
+        - box (tuple): The bounding box coordinates as (x1, y1, x2, y2).
+        - conf (float): Confidence score of the detection.
+        - cls (int): Class ID of the detection.
+        - id (int): Unique identifier for the detection.
+        - thickness (int): The thickness of the bounding box.
+        - fontscale (float): The font scale for the text.
+
+        Returns:
+        - np.ndarray: The image array with the bounding box drawn on it.
+        """
+        if self.is_obb:
+            
+            angle = box[4] * 180.0 / np.pi  # Convert radians to degrees
+            box_poly = ((box[0], box[1]), (box[2], box[3]), angle)
+            # print((width, height))
+            rotrec = cv.boxPoints(box_poly)
+            box_poly = np.int_(rotrec)  # Convert to integer
+
+            # Draw the rectangle on the image
+            img = cv.polylines(img, [box_poly], isClosed=True, color=self.id_to_color(id), thickness=thickness)
+
+            img = cv.putText(
+                img,
+                f'id: {int(id)}, conf: {conf:.2f}, c: {int(cls)}, a: {box[4]:.2f}',
+                (int(box[0]), int(box[1]) - 10),
+                cv.FONT_HERSHEY_SIMPLEX,
+                fontscale,
+                self.id_to_color(id),
+                thickness
+            )
+        else :
+
+            img = cv.rectangle(
+                img,
+                (int(box[0]), int(box[1])),
+                (int(box[2]), int(box[3])),
+                self.id_to_color(id),
+                thickness
+            )
+            img = cv.putText(
+                img,
+                f'id: {int(id)}, conf: {conf:.2f}, c: {int(cls)}',
+                (int(box[0]), int(box[1]) - 10),
+                cv.FONT_HERSHEY_SIMPLEX,
+                fontscale,
+                self.id_to_color(id),
+                thickness
+            )
+        return img
+
+
+    def plot_trackers_trajectories(self, img: np.ndarray, observations: list, id: int) -> np.ndarray:
+        """
+        Draws the trajectories of tracked objects based on historical observations. Each point
+        in the trajectory is represented by a circle, with the thickness increasing for more
+        recent observations to visualize the path of movement.
+
+        Parameters:
+        - img (np.ndarray): The image array on which to draw the trajectories.
+        - observations (list): A list of bounding box coordinates representing the historical
+        observations of a tracked object. Each observation is in the format (x1, y1, x2, y2).
+        - id (int): The unique identifier of the tracked object for color consistency in visualization.
+
+        Returns:
+        - np.ndarray: The image array with the trajectories drawn on it.
+        """
+        for i, box in enumerate(observations):
+            trajectory_thickness = int(np.sqrt(float (i + 1)) * 1.2)
+            if self.is_obb:
+                img = cv.circle(
+                    img,
+                    (int(box[0]), int(box[1])),
+                    2,
+                    color=self.id_to_color(int(id)),
+                    thickness=trajectory_thickness 
+                )
+            else:
+
+                img = cv.circle(
+                    img,
+                    (int((box[0] + box[2]) / 2),
+                    int((box[1] + box[3]) / 2)), 
+                    2,
+                    color=self.id_to_color(int(id)),
+                    thickness=trajectory_thickness
+                )
+        return img
+    
+    def plot_results(self, img: np.ndarray, show_trajectories: bool, thickness: int = 2, fontscale: float = 0.5) -> np.ndarray:
+        """
+        Visualizes the trajectories of all active tracks on the image. For each track,
+        it draws the latest bounding box and the path of movement if the history of
+        observations is longer than two. This helps in understanding the movement patterns
+        of each tracked object.
+
+        Parameters:
+        - img (np.ndarray): The image array on which to draw the trajectories and bounding boxes.
+        - show_trajectories (bool): Whether to show the trajectories.
+        - thickness (int): The thickness of the bounding box.
+        - fontscale (float): The font scale for the text.
+
+        Returns:
+        - np.ndarray: The image array with trajectories and bounding boxes of all active tracks.
+        """
+
+        # if values in dict
+        if self.per_class_active_tracks is not None:
+            for k in self.per_class_active_tracks.keys():
+                active_tracks = self.per_class_active_tracks[k]
+                for a in active_tracks:
+                    if a.history_observations:
+                        if a.hits >= self.min_hits:
+                            if len(a.history_observations) > 2:
+                                box = a.history_observations[-1]
+                                img = self.plot_box_on_img(img, box, a.conf, a.cls, a.id, thickness, fontscale)
+                                if show_trajectories:
+                                    img = self.plot_trackers_trajectories(img, a.history_observations, a.id)
+        else:
+            for a in self.active_tracks:
+                if a.history_observations:
+                    if a.hits >= self.min_hits:
+                        if len(a.history_observations) > 2:
+                            box = a.history_observations[-1]
+                            img = self.plot_box_on_img(img, box, a.conf, a.cls, a.id, thickness, fontscale)
+                            if show_trajectories:
+                                img = self.plot_trackers_trajectories(img, a.history_observations, a.id)
+                
+        return img
+    
